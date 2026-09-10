@@ -1,0 +1,4 @@
+# CUDA 13.3 is not recognized by cudarc 0.17.8 (from candle's ug-cuda dependency).
+# Map it to CUDA 13.0 bindings which are backward compatible.
+[env]
+CUDARC_CUDA_VERSION = "13000"

@@ -1,0 +1,83 @@
+[package]
+name = "gabriel"
+version = "0.1.0"
+description = "Gabriel - native zero-crash multi-modal local AI engine"
+authors = ["you"]
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+name = "gabriel_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.12"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sysinfo = "0.33"
+rayon = "1.10"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+nvml-wrapper = { version = "0.10", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.30", optional = true }
+
+[features]
+default = ["nvml", "candle-cuda"]
+nvml = ["dep:nvml-wrapper"]
+metal = ["dep:metal"]
+candle-cuda = ["dep:candle-core", "dep:candle-transformers", "dep:candle-kernels", "dep:tokenizers", "dep:hf-hub", "dep:image", "dep:candle-nn"]
+tts-parler = ["dep:candle-core", "dep:candle-transformers", "dep:candle-nn", "dep:tokenizers", "dep:hf-hub"]
+
+[dependencies.candle-core]
+git = "https://github.com/huggingface/candle.git"
+features = ["cuda", "ug"]
+optional = true
+
+[dependencies.candle-transformers]
+git = "https://github.com/huggingface/candle.git"
+optional = true
+
+[dependencies.candle-kernels]
+git = "https://github.com/huggingface/candle.git"
+optional = true
+
+[dependencies.candle-nn]
+git = "https://github.com/huggingface/candle.git"
+features = ["cuda"]
+optional = true
+
+[dependencies.tokenizers]
+version = "0.21"
+optional = true
+
+[dependencies.hf-hub]
+version = "0.5.0"
+default-features = false
+features = ["tokio", "ureq"]
+optional = true
+
+
+[dependencies.image]
+version = "0.25"
+default-features = false
+features = ["png"]
+optional = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
