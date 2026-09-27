@@ -48,6 +48,8 @@ pub struct ModelSpec {
     #[serde(rename = "model_type")]
     pub model_type: ModelType,
     pub vram_bytes: u64,
+    #[serde(default)]
+    pub disk_bytes: u64,
 }
 
 impl ModelSpec {
@@ -74,6 +76,7 @@ impl ModelSpec {
             id: id_str,
             model_type,
             vram_bytes: vram_bytes.unwrap_or(default_bytes),
+            disk_bytes: 0,
         }
     }
 }
@@ -92,8 +95,13 @@ pub struct ModelRuntimeInfo {
     pub id: String,
     pub model_type: ModelType,
     pub residency: Residency,
+    pub available: bool,
     pub vram_bytes: u64,
+    pub disk_bytes: u64,
     pub idle_secs: u64,
+    /// Unix timestamp (secs) when the model became resident. The UI derives
+    /// live uptime from this; `idle_secs` is time-since-last-use instead.
+    pub loaded_at_unix: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

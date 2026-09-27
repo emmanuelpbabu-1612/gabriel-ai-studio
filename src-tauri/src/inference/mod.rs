@@ -60,7 +60,9 @@ impl BackendFactory {
     pub async fn create(&self, spec: &ModelSpec) -> Result<crate::core::engine::ModelHandle> {
         use crate::core::engine::ModelHandle;
 
+        #[cfg(any(feature = "candle-cuda", feature = "tts-parler"))]
         let lower = spec.id.to_ascii_lowercase();
+        #[cfg(any(feature = "candle-cuda", feature = "tts-parler"))]
         let is_real = lower.contains("qwen")
             || lower.contains("sd-")
             || lower.contains("sd1")

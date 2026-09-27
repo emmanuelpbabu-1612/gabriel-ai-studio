@@ -4,6 +4,9 @@
   "version": "0.1.0",
   "identifier": "dev.gabriel.engine",
   "build": {
+    "beforeDevCommand": "pnpm run kill:stale && pnpm dev",
+    "beforeBuildCommand": "pnpm build",
+    "devUrl": "http://localhost:5173",
     "frontendDist": "../dist"
   },
   "app": {

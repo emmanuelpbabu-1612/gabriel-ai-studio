@@ -303,8 +303,6 @@ export const settingsSections = [
   { id: 'general', label: 'General', icon: 'Settings' },
   { id: 'appearance', label: 'Appearance', icon: 'Palette' },
   { id: 'governor', label: 'Engine Governor', icon: 'Cpu' },
-  { id: 'models-storage', label: 'Models & Storage', icon: 'HardDrive' },
-  { id: 'performance', label: 'Performance', icon: 'Gauge' },
   { id: 'shortcuts', label: 'Keyboard Shortcuts', icon: 'Keyboard' },
 ];
 

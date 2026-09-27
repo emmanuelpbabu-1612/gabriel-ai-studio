@@ -1,12 +1,19 @@
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+use std::fs;
+use std::io::{Read, Write};
+use std::path::Path;
+use serde::Serialize;
 
 use parking_lot::RwLock;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::error::{GabrielError, Result};
-use crate::inference::{BackendFactory, ImageBackend, SpeechBackend, TextBackend, hub};
+use crate::inference::{BackendFactory, ImageBackend, SpeechBackend, TextBackend};
+#[cfg(any(feature = "candle-cuda", feature = "tts-parler"))]
+use crate::inference::hub;
 use crate::telemetry::Telemetry;
 use crate::types::{
     ChatEvent, GenParams, Job, JobId, JobKind, ModelRuntimeInfo, ModelSpec, ModelStatus, ModelType,
@@ -18,6 +25,17 @@ use super::bandwidth::{BandwidthGovernor, GovernorConfig};
 use super::pager::{MemoryPager, PagerConfig};
 use super::registry::Registry;
 use super::scheduler::{Scheduler, dispatch};
+use super::settings::{self, PersistedSettings};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Notification {
+    pub id: u64,
+    pub title: String,
+    pub message: String,
+    pub level: String,
+    pub read: bool,
+    pub created_at_unix: u64,
+}
 
 #[derive(Clone)]
 pub enum ModelHandle {
@@ -47,16 +65,20 @@ impl std::fmt::Debug for ModelHandle {
 }
 
 pub struct EngineInner {
-    pub config: EngineConfig,
+    pub config: Arc<RwLock<EngineConfig>>,
     pub registry: Arc<RwLock<Registry>>,
     pub telemetry: Arc<Telemetry>,
     pub pager: Arc<MemoryPager>,
     pub governor: Arc<BandwidthGovernor>,
     pub scheduler: Scheduler,
     pub factory: BackendFactory,
+    pub settings: Arc<RwLock<PersistedSettings>>,
+    pub notifications: Arc<RwLock<Vec<Notification>>>,
+    next_notification_id: AtomicUsize,
     image_permits: Arc<Semaphore>,
     active_jobs: AtomicUsize,
     load_gate: tokio::sync::Mutex<()>,
+    download_cancels: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 impl EngineInner {
@@ -232,6 +254,33 @@ impl std::fmt::Debug for EngineState {
 
 impl EngineState {
     pub fn new(config: EngineConfig) -> Self {
+        let persisted = settings::load();
+        let mut config = config;
+        config.vram_high_watermark = persisted.vram_high_watermark / 100.0;
+        config.vram_low_watermark = persisted.vram_low_watermark / 100.0;
+        config.bandwidth_ceiling_percent = persisted.bandwidth_ceiling_percent.clamp(10.0, 100.0);
+        config.max_loaded_models = persisted.max_loaded_models.clamp(1, 32);
+        config.auto_load_on_request = persisted.auto_load_on_request;
+        config.idle_offload_after = Duration::from_secs(persisted.idle_offload_after_secs.clamp(10, 3600));
+        match persisted.engine_mode.as_str() {
+            "performance" => {
+                config.vram_high_watermark = 0.95;
+                config.vram_low_watermark = 0.80;
+                config.bandwidth_ceiling_percent = 100.0;
+            }
+            "efficiency" => {
+                config.vram_high_watermark = 0.75;
+                config.vram_low_watermark = 0.55;
+                config.bandwidth_ceiling_percent = 60.0;
+            }
+            _ => {}
+        }
+        // Save values for logging before config is moved
+        let log_host = config.host.clone();
+        let log_port = config.port;
+        let log_high_watermark = config.vram_high_watermark;
+        let log_pager_poll_interval = config.pager_poll_interval;
+
         let telemetry = Arc::new(Telemetry::new());
         let registry = Arc::new(RwLock::new(Registry::default()));
 
@@ -257,19 +306,26 @@ impl EngineState {
             image_permits: Arc::new(Semaphore::new(config.max_concurrent_image_jobs)),
             active_jobs: AtomicUsize::new(0),
             load_gate: tokio::sync::Mutex::new(()),
-            config: config.clone(),
+            config: Arc::new(RwLock::new(config)),
             registry: registry.clone(),
             telemetry: telemetry.clone(),
             pager: pager.clone(),
             governor: governor.clone(),
             scheduler,
             factory: BackendFactory::new(governor.clone()),
+            settings: Arc::new(RwLock::new(persisted)),
+            notifications: Arc::new(RwLock::new(Vec::new())),
+            next_notification_id: AtomicUsize::new(1),
+            download_cancels: Arc::new(RwLock::new(HashMap::new())),
         });
+
+        Self::cleanup_partial_downloads();
+        Self::reconcile_model_directory(&inner);
 
         {
             let governor = governor.clone();
             let telemetry = telemetry.clone();
-            let interval = config.pager_poll_interval;
+            let interval = log_pager_poll_interval;
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -285,13 +341,156 @@ impl EngineState {
         tokio::spawn(dispatch::run(rx, Self(inner.clone())));
 
         tracing::info!(
-            host = %config.host,
-            port = config.port,
-            high_watermark = config.vram_high_watermark,
+            host = %log_host,
+            port = log_port,
+            high_watermark = log_high_watermark,
             "engine initialized"
         );
 
         Self(inner)
+    }
+
+    pub fn reconcile_model_directory(inner: &Arc<EngineInner>) {
+        let Some(models_dir) = settings::models_dir() else { return };
+        let Ok(entries) = fs::read_dir(&models_dir) else { return };
+        let mut registry = inner.registry.write();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() { continue; }
+            let Some(file_name) = path.file_stem().and_then(|value| value.to_str()) else { continue };
+            let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase();
+            // Filename hint for voice models: TTS weight files (e.g. the
+            // kokoro-voice fixture) can carry a generic extension, so a known
+            // voice marker in the stem takes precedence over the extension
+            // sniff below. Files without a marker are typed as before.
+            let stem_lower = file_name.to_ascii_lowercase();
+            let voice_hint = ["kokoro", "tts", "text-to-speech", "voice", "parler", "bark", "xtts", "piper"]
+                .iter()
+                .any(|marker| stem_lower.contains(marker));
+            let model_type = if voice_hint {
+                ModelType::Tts
+            } else {
+                match extension.as_str() {
+                    "gguf" | "ggml" => ModelType::Llm,
+                    "safetensors" => {
+                        tracing::warn!(path = %path.display(), "skipping ambiguous safetensors file; import it with an explicit model kind");
+                        continue;
+                    }
+                    _ => continue,
+                }
+            };
+            if registry.contains(file_name) { continue; }
+            let mut spec = ModelSpec::new(file_name, model_type, None);
+            spec.disk_bytes = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            registry.insert_available(spec);
+            tracing::info!(model = file_name, "reconciled model file into registry");
+        }
+    }
+
+    pub fn engine_mode(&self) -> String {
+        self.inner().settings.read().engine_mode.clone()
+    }
+
+    pub fn set_engine_mode(&self, mode: &str) -> Result<String> {
+        let mut settings = self.inner().settings.write();
+        settings::apply_mode(&mut settings, mode)
+            .map_err(GabrielError::InvalidRequest)?;
+        settings::save(&settings)?;
+        Ok(settings.engine_mode.clone())
+    }
+
+    pub fn engine_settings(&self) -> PersistedSettings {
+        self.inner().settings.read().clone()
+    }
+
+    pub fn set_watermarks(&self, high: f64, low: f64) -> Result<PersistedSettings> {
+        if !(50.0..=98.0).contains(&high) || !(30.0..=80.0).contains(&low) || low >= high {
+            return Err(GabrielError::InvalidRequest("invalid VRAM watermark range".into()));
+        }
+        let mut settings = self.inner().settings.write();
+        settings.vram_high_watermark = high;
+        settings.vram_low_watermark = low;
+        settings::save(&settings)?;
+        let saved = settings.clone();
+        drop(settings);
+        // Apply live (previously this only took effect after a restart:
+        // the pager loop reads its own config snapshot, not settings).
+        self.inner().config.write().vram_high_watermark = high / 100.0;
+        self.inner().config.write().vram_low_watermark = low / 100.0;
+        self.pager().update_watermarks(high / 100.0, low / 100.0);
+        Ok(saved)
+    }
+
+    pub fn profile_name(&self) -> String {
+        self.inner().settings.read().display_name.clone()
+    }
+
+    pub fn set_profile_name(&self, name: String) -> Result<String> {
+        let name = name.trim().to_string();
+        if name.is_empty() || name.len() > 80 {
+            return Err(GabrielError::InvalidRequest("display name must be 1-80 characters".into()));
+        }
+        let mut settings = self.inner().settings.write();
+        settings.display_name = name;
+        settings::save(&settings)?;
+        Ok(settings.display_name.clone())
+    }
+
+    pub fn pager_status(&self) -> String {
+        if self.inner().telemetry.gpu_sample().total_bytes > 0 { "active".into() } else { "degraded".into() }
+    }
+
+    pub fn notifications(&self) -> Vec<Notification> {
+        self.inner().notifications.read().clone()
+    }
+
+    pub fn mark_notification_read(&self, id: u64) {
+        if let Some(notification) = self.inner().notifications.write().iter_mut().find(|item| item.id == id) {
+            notification.read = true;
+        }
+    }
+
+    pub fn notify(&self, title: impl Into<String>, message: impl Into<String>, level: &str) {
+        let id = self.inner().next_notification_id.fetch_add(1, Ordering::Relaxed) as u64;
+        self.inner().notifications.write().insert(0, Notification {
+            id,
+            title: title.into(),
+            message: message.into(),
+            level: level.into(),
+            read: false,
+            created_at_unix: unix_now(),
+        });
+    }
+
+    pub async fn restart(&self) -> Result<()> {
+        let fresh_settings = settings::load();
+        *self.inner().settings.write() = fresh_settings.clone();
+
+        {
+            let mut registry = self.inner().registry.write();
+            registry.reset_resident();
+        }
+
+        let high = fresh_settings.vram_high_watermark / 100.0;
+        let low = fresh_settings.vram_low_watermark / 100.0;
+        self.inner().config.write().vram_high_watermark = high;
+        self.inner().config.write().vram_low_watermark = low;
+        self.pager().update_watermarks(high, low);
+        self.pager().update_idle_timeout(Duration::from_secs(fresh_settings.idle_offload_after_secs));
+        self.governor().update_ceiling_percent(fresh_settings.bandwidth_ceiling_percent);
+        self.set_max_loaded_models(fresh_settings.max_loaded_models);
+        self.set_auto_load_on_request(fresh_settings.auto_load_on_request);
+
+        Self::reconcile_model_directory(&self.inner_arc());
+
+        self.notify(
+            "Engine Restarted",
+            "Engine state reloaded in-place, configurations refreshed, and model directory rescanned.",
+            "info",
+        );
+
+        tracing::info!("Engine restarted in-place successfully");
+        Ok(())
     }
 
     fn inner(&self) -> &EngineInner {
@@ -306,6 +505,18 @@ impl EngineState {
         self.0.governor.clone()
     }
 
+    pub fn set_max_loaded_models(&self, max_models: usize) {
+        self.0.config.write().max_loaded_models = max_models;
+    }
+
+    pub fn set_auto_load_on_request(&self, enabled: bool) {
+        self.0.config.write().auto_load_on_request = enabled;
+    }
+
+    pub fn set_idle_offload_after(&self, duration: Duration) {
+        self.0.config.write().idle_offload_after = duration;
+    }
+
     pub async fn load_model(
         &self,
         model_id: &str,
@@ -314,11 +525,22 @@ impl EngineState {
     ) -> Result<ModelStatus> {
         let _gate = self.inner().load_gate.lock().await;
 
-        if self.inner().registry.read().contains(model_id) {
-            return Err(GabrielError::AlreadyLoaded(model_id.to_string()));
+        if let Some(entry) = self.inner().registry.read().get(model_id) {
+            if entry.handle.is_some() {
+                return Err(GabrielError::AlreadyLoaded(model_id.to_string()));
+            }
         }
 
-        let slot_limit = self.inner().config.max_loaded_models;
+        let preserved_disk_bytes = self.inner().registry.read()
+            .get(model_id)
+            .map(|e| e.spec.disk_bytes)
+            .unwrap_or(0);
+
+        if self.inner().registry.read().contains(model_id) {
+            self.inner().registry.write().remove(model_id);
+        }
+
+        let slot_limit = self.inner().config.read().max_loaded_models;
 
         // Eviction with infinite loop safeguard
         let mut attempts = 0;
@@ -330,7 +552,7 @@ impl EngineState {
 
             let victim = {
                 let reg = self.inner().registry.read();
-                reg.least_recently_used_any_idle(self.inner().config.idle_offload_after)
+                reg.least_recently_used_any_idle(self.inner().config.read().idle_offload_after)
             };
 
             let Some(victim_id) = victim else {
@@ -344,7 +566,10 @@ impl EngineState {
             }
         }
 
-        let spec = ModelSpec::new(model_id, model_type, vram_bytes);
+        let mut spec = ModelSpec::new(model_id, model_type, vram_bytes);
+        if spec.disk_bytes == 0 {
+            spec.disk_bytes = preserved_disk_bytes;
+        }
         self.inner().pager.admit(spec.vram_bytes)?;
 
         let handle = self.inner().factory.create(&spec).await.inspect_err(|_| {
@@ -377,6 +602,7 @@ impl EngineState {
             ?model_type,
             "model resident on GPU"
         );
+        self.notify("Model loaded", format!("{model_id} is resident on the GPU"), "success");
 
         Ok(ModelStatus {
             model_id: model_id.to_string(),
@@ -403,7 +629,11 @@ impl EngineState {
             self.inner().registry.write().demote(model_id);
             self.inner().pager.on_demoted_or_unloaded(spec.vram_bytes);
             tracing::info!(model = %model_id, "model offloaded VRAM -> RAM by request");
+            self.notify("Model offloaded", format!("{model_id} was paged to system RAM"), "info");
         }
+        // No notify when nothing was resident: an offload request against an
+        // already-idle model is a no-op, and logging it as an event makes
+        // System Logs look like the model is flapping in and out of residency.
 
         Ok(ModelStatus {
             model_id: model_id.to_string(),
@@ -432,6 +662,7 @@ impl EngineState {
         }
 
         tracing::info!(model = %model_id, "model unloaded");
+        self.notify("Model unloaded", format!("{model_id} was removed from the engine"), "info");
         Ok(ModelStatus {
             model_id: model_id.to_string(),
             model_type: entry.0.model_type,
@@ -460,7 +691,7 @@ impl EngineState {
             }
         }
 
-        if !self.inner().config.auto_load_on_request {
+        if !self.inner().config.read().auto_load_on_request {
             return Err(GabrielError::ModelNotLoaded(model_id.to_string()));
         }
 
@@ -617,7 +848,220 @@ impl EngineState {
     }
 
     pub fn list_models(&self) -> Vec<ModelRuntimeInfo> {
-        self.inner().registry.read().snapshot()
+        let models = self.inner().registry.read().snapshot();
+        tracing::info!(count = models.len(), "listing models");
+        models
+    }
+
+    pub fn register_local_model(&self, source: String, kind: &str) -> Result<ModelRuntimeInfo> {
+        tracing::info!(source = %source, kind, "registering local model");
+        let source_path = Path::new(&source);
+        let file_name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| GabrielError::InvalidRequest("invalid model file path".into()))?;
+        let model_type = ModelType::parse(kind)
+            .ok_or_else(|| GabrielError::UnknownModelType(kind.to_string()))?;
+        let models_dir = settings::models_dir()
+            .ok_or_else(|| GabrielError::Internal("model storage directory unavailable".into()))?;
+        fs::create_dir_all(&models_dir)?;
+        let destination = if source_path.parent() == Some(models_dir.as_path()) {
+            source_path.to_path_buf()
+        } else {
+            let destination = models_dir.join(file_name);
+            fs::copy(source_path, &destination)?;
+            destination
+        };
+        let disk_bytes = fs::metadata(&destination)?.len();
+        let id = destination
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or(file_name)
+            .to_string();
+        let mut spec = ModelSpec::new(id.clone(), model_type, None);
+        spec.disk_bytes = disk_bytes;
+        let mut registry = self.inner().registry.write();
+        registry.insert_available(spec);
+        tracing::info!(model = %id, disk_bytes, kind, "registered local model");
+        registry
+            .snapshot()
+            .into_iter()
+            .find(|model| model.id == id)
+            .ok_or_else(|| GabrielError::Internal("registered model was not found".into()))
+    }
+
+    /// Remove stale `.part` files left by downloads interrupted by an app
+    /// shutdown. Only the known temp suffix is cleaned — anything else on
+    /// disk (even unregistered files) is left alone.
+    pub fn cleanup_partial_downloads() {
+        let Some(dir) = settings::models_dir() else { return };
+        let Ok(entries) = fs::read_dir(&dir) else { return };
+        let mut removed = 0u32;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("part")
+                && fs::remove_file(&path).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            tracing::warn!(removed, "cleaned up partial model downloads from a previous session");
+        }
+    }
+
+    pub async fn download_huggingface_model(&self, repo_id: String, filename: String, kind: String) -> Result<ModelRuntimeInfo> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        match self.download_inner(repo_id, filename, kind, cancel, |_, _| {}).await? {
+            Some(info) => Ok(info),
+            None => Err(GabrielError::Internal("download cancelled".into())),
+        }
+    }
+
+    pub async fn download_huggingface_model_with_progress(
+        &self,
+        repo_id: String,
+        filename: String,
+        kind: String,
+        on_progress: impl Fn(u64, Option<u64>) + Send + 'static,
+    ) -> Result<ModelRuntimeInfo> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        match self.download_inner(repo_id, filename, kind, cancel, on_progress).await? {
+            Some(info) => Ok(info),
+            None => Err(GabrielError::Internal("download cancelled".into())),
+        }
+    }
+
+    /// Fire-and-forget variant for the Tauri UI: the caller supplies a
+    /// download id (so progress/done events can be correlated with no race),
+    /// the outcome is delivered to `on_done` (`Ok(Some)` = registered,
+    /// `Ok(None)` = cancelled, `Err` = failed). Progress flows through
+    /// `on_progress` as before.
+    pub fn start_hf_download(
+        &self,
+        download_id: String,
+        repo_id: String,
+        filename: String,
+        kind: String,
+        on_progress: impl Fn(u64, Option<u64>) + Send + 'static,
+        on_done: impl FnOnce(Result<Option<ModelRuntimeInfo>>) + Send + 'static,
+    ) {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.inner()
+            .download_cancels
+            .write()
+            .insert(download_id.clone(), flag.clone());
+        let this = self.clone();
+        tokio::spawn(async move {
+            let outcome = this
+                .download_inner(repo_id, filename, kind, flag, on_progress)
+                .await;
+            this.inner().download_cancels.write().remove(&download_id);
+            on_done(outcome);
+        });
+    }
+
+    /// Signal a running download to abort. Returns true if a matching active
+    /// download was found. The loop exits at the next chunk boundary, deletes
+    /// the partial file, and never registers anything.
+    pub fn cancel_hf_download(&self, download_id: &str) -> bool {
+        if let Some(flag) = self.inner().download_cancels.read().get(download_id) {
+            flag.store(true, Ordering::Relaxed);
+            tracing::info!(download_id, "cancellation requested for Hugging Face download");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Streaming download core shared by the blocking and fire-and-forget
+    /// paths. Returns `Ok(None)` when `cancel` is set — the partial file is
+    /// deleted and nothing is registered in that case.
+    async fn download_inner(
+        &self,
+        repo_id: String,
+        filename: String,
+        kind: String,
+        cancel: Arc<AtomicBool>,
+        on_progress: impl Fn(u64, Option<u64>) + Send + 'static,
+    ) -> Result<Option<ModelRuntimeInfo>> {
+        tracing::info!(repo = %repo_id, file = %filename, kind = %kind, "starting Hugging Face model download");
+        let url = format!("https://huggingface.co/{repo_id}/resolve/main/{filename}");
+        let download_repo_id = repo_id.clone();
+        let log_filename = filename.clone();
+        let outcome = tokio::task::spawn_blocking(move || -> Result<Option<(std::path::PathBuf, u64)>> {
+            // Generous timeouts: model files are GB-scale, so the connect is
+            // bounded but the transfer itself gets a 30-minute budget.
+            let config = ureq::Agent::config_builder()
+                .timeout_connect(Some(Duration::from_secs(30)))
+                .timeout_global(Some(Duration::from_secs(30 * 60)))
+                .build();
+            let agent = ureq::Agent::new_with_config(config);
+            let fail = |error: String| GabrielError::DownloadFailed {
+                repo: download_repo_id.clone(),
+                filename: error,
+            };
+            let response = agent.get(&url).call().map_err(|error| fail(error.to_string()))?;
+            let body = response.into_body();
+            let total = body.content_length();
+            let mut reader = body.into_reader();
+            let dir = settings::models_dir()
+                .ok_or_else(|| GabrielError::Internal("model storage directory unavailable".into()))?;
+            fs::create_dir_all(&dir)?;
+            let basename = Path::new(&filename)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("model.bin");
+            let destination = dir.join(basename);
+            let tmp = dir.join(format!("{basename}.part"));
+            let result: Result<Option<(std::path::PathBuf, u64)>> = (|| {
+                let mut file = fs::File::create(&tmp)?;
+                let mut buf = [0u8; 64 * 1024];
+                let mut downloaded: u64 = 0;
+                let mut last_emit: u64 = 0;
+                on_progress(0, total);
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    let n = reader
+                        .read(&mut buf)
+                        .map_err(|error| fail(error.to_string()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    file.write_all(&buf[..n])?;
+                    downloaded += n as u64;
+                    if downloaded - last_emit >= 1024 * 1024 {
+                        last_emit = downloaded;
+                        on_progress(downloaded, total);
+                    }
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                on_progress(downloaded, total);
+                drop(file);
+                fs::rename(&tmp, &destination)?;
+                Ok(Some((destination, downloaded)))
+            })();
+            if !matches!(result, Ok(Some(_))) {
+                let _ = fs::remove_file(&tmp);
+            }
+            result
+        })
+        .await
+        .map_err(|error| GabrielError::Internal(error.to_string()))??;
+        let Some((destination, downloaded)) = outcome else {
+            tracing::info!(repo = %repo_id, file = %log_filename, "Hugging Face download cancelled, partial file removed");
+            return Ok(None);
+        };
+        tracing::info!(repo = %repo_id, file = %log_filename, bytes = downloaded, "downloaded Hugging Face model file");
+        let result = self.register_local_model(destination.to_string_lossy().into_owned(), &kind);
+        if result.is_ok() {
+            tracing::info!(repo = %repo_id, file = %log_filename, "finished Hugging Face model download");
+        }
+        result.map(Some)
     }
 
     pub fn telemetry_snapshot(&self) -> TelemetrySnapshot {
@@ -633,7 +1077,7 @@ impl EngineState {
             gpu_util_percent: gpu.utilization_percent,
             vram_total_bytes: gpu.total_bytes,
             vram_used_bytes: gpu.used_bytes,
-            vram_high_watermark: self.inner().config.vram_high_watermark,
+            vram_high_watermark: self.inner().config.read().vram_high_watermark,
             engine_resident_bytes: vram_snap.engine_tracked_bytes,
             vram_untracked_bytes: vram_snap.untracked_bytes,
             vram_peak_untracked_bytes: self.inner().pager.peak_untracked_bytes(),
@@ -646,7 +1090,27 @@ impl EngineState {
         }
     }
 
-    pub fn config(&self) -> &EngineConfig {
-        &self.inner().config
+    pub fn config(&self) -> EngineConfig {
+        self.inner().config.read().clone()
+    }
+
+    pub fn telemetry(&self) -> Arc<Telemetry> {
+        self.0.telemetry.clone()
+    }
+
+    pub fn registry(&self) -> Arc<RwLock<Registry>> {
+        self.0.registry.clone()
+    }
+
+    pub fn pager(&self) -> Arc<MemoryPager> {
+        self.0.pager.clone()
+    }
+
+    pub fn scheduler(&self) -> &Scheduler {
+        &self.0.scheduler
+    }
+
+    pub fn active_jobs(&self) -> &AtomicUsize {
+        &self.0.active_jobs
     }
 }

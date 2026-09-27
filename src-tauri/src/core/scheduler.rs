@@ -1,3 +1,4 @@
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use tokio::sync::mpsc;
 
 use crate::types::{Job, Priority};
@@ -6,30 +7,36 @@ use crate::types::{Job, Priority};
 pub struct Scheduler {
     high: mpsc::Sender<Job>,
     standard: mpsc::Sender<Job>,
+    queue_depth: Arc<AtomicUsize>,
 }
 
 pub struct SchedulerReceiver {
     pub high: mpsc::Receiver<Job>,
     pub standard: mpsc::Receiver<Job>,
+    queue_depth: Arc<AtomicUsize>,
 }
 
 impl Scheduler {
     pub fn new(queue_capacity: usize) -> (Self, SchedulerReceiver) {
         let (high_tx, high_rx) = mpsc::channel(queue_capacity);
         let (std_tx, std_rx) = mpsc::channel(queue_capacity);
+        let queue_depth = Arc::new(AtomicUsize::new(0));
         (
             Self {
                 high: high_tx,
                 standard: std_tx,
+                queue_depth: queue_depth.clone(),
             },
             SchedulerReceiver {
                 high: high_rx,
                 standard: std_rx,
+                queue_depth,
             },
         )
     }
 
     pub async fn submit(&self, job: Job) -> Result<(), Job> {
+        self.queue_depth.fetch_add(1, Ordering::Relaxed);
         match job.priority {
             Priority::Interactive => self.high.send(job).await.map_err(|e| e.0),
             Priority::Standard => self.standard.send(job).await.map_err(|e| e.0),
@@ -38,16 +45,22 @@ impl Scheduler {
 
     #[allow(dead_code)]
     pub fn try_submit(&self, job: Job) -> Result<(), Job> {
+        self.queue_depth.fetch_add(1, Ordering::Relaxed);
         match job.priority {
             Priority::Interactive => self.high.try_send(job).map_err(|e| e.into_inner()),
             Priority::Standard => self.standard.try_send(job).map_err(|e| e.into_inner()),
         }
+    }
+
+    pub fn queue_depth(&self) -> usize {
+        self.queue_depth.load(Ordering::Relaxed)
     }
 }
 
 pub mod dispatch {
 
 
+    use std::sync::atomic::Ordering;
     use crate::core::engine::EngineState;
     use crate::types::Job;
 
@@ -62,24 +75,36 @@ pub mod dispatch {
             tokio::select! {
                 biased;
                 job = rx.high.recv() => match job {
-                    Some(j) => Some(j),
+                    Some(j) => {
+                        rx.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                        Some(j)
+                    },
                     None => { *high_open = false; None }
                 },
                 job = rx.standard.recv() => match job {
-                    Some(j) => Some(j),
+                    Some(j) => {
+                        rx.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                        Some(j)
+                    },
                     None => { *standard_open = false; None }
                 },
             }
         } else if *high_open {
             match rx.high.recv().await {
-                Some(j) => Some(j),
+                Some(j) => {
+                    rx.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                    Some(j)
+                },
                 None => {
                     *high_open = false;
                     None
                 }
             }
         } else if *standard_open {
-            rx.standard.recv().await
+            rx.standard.recv().await.map(|j| {
+                rx.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                j
+            })
         } else {
             None
         }

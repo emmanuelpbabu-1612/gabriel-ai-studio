@@ -68,7 +68,7 @@ pub struct VramSnapshot {
 }
 
 pub struct MemoryPager {
-    config: PagerConfig,
+    config: RwLock<PagerConfig>,
     telemetry: Arc<Telemetry>,
     registry: Arc<RwLock<Registry>>,
     /// Bytes tracked by the engine (model weights only)
@@ -91,7 +91,7 @@ impl std::fmt::Debug for MemoryPager {
 impl Clone for MemoryPager {
     fn clone(&self) -> Self {
         Self {
-            config: self.config.clone(),
+            config: RwLock::new(self.config.read().clone()),
             telemetry: self.telemetry.clone(),
             registry: self.registry.clone(),
             engine_resident_bytes: self.engine_resident_bytes.clone(),
@@ -108,7 +108,7 @@ impl MemoryPager {
         registry: Arc<RwLock<Registry>>,
     ) -> Self {
         Self {
-            config,
+            config: RwLock::new(config),
             telemetry,
             registry,
             engine_resident_bytes: Arc::new(Mutex::new(0)),
@@ -173,11 +173,12 @@ impl MemoryPager {
         };
 
         if sample.total_bytes > 0 {
+            let config = self.config.read();
             snap.untracked_bytes = sample.used_bytes.saturating_sub(tracked);
             snap.utilization_ratio = sample.used_bytes as f64 / sample.total_bytes as f64;
-            snap.pressure = if snap.utilization_ratio >= self.config.high_watermark {
+            snap.pressure = if snap.utilization_ratio >= config.high_watermark {
                 MemoryPressure::Critical
-            } else if snap.utilization_ratio >= self.config.low_watermark {
+            } else if snap.utilization_ratio >= config.low_watermark {
                 MemoryPressure::Moderate
             } else {
                 MemoryPressure::None
@@ -201,8 +202,9 @@ impl MemoryPager {
         if snap.total_bytes == 0 {
             return u64::MAX;
         }
-        let cap = (snap.total_bytes as f64 * self.config.high_watermark) as u64;
-        let margin = self.config.vram_safety_margin_bytes;
+        let config = self.config.read();
+        let cap = (snap.total_bytes as f64 * config.high_watermark) as u64;
+        let margin = config.vram_safety_margin_bytes;
         cap.saturating_sub(snap.used_bytes).saturating_sub(margin)
     }
 
@@ -220,7 +222,8 @@ impl MemoryPager {
             return Ok(());
         }
 
-        let budget_cap = (snap.total_bytes as f64 * self.config.high_watermark) as u64;
+        let config = self.config.read();
+        let budget_cap = (snap.total_bytes as f64 * config.high_watermark) as u64;
 
         if incoming_bytes > budget_cap {
             return Err(GabrielError::VramExhausted {
@@ -240,7 +243,7 @@ impl MemoryPager {
         let candidates = self
             .registry
             .read()
-            .evictable_idle(self.config.idle_offload_after);
+            .evictable_idle(config.idle_offload_after);
         for id in candidates {
             if freed >= incoming_bytes.saturating_sub(headroom) {
                 break;
@@ -259,9 +262,10 @@ impl MemoryPager {
         }
 
         let snap_after = self.vram_snapshot();
+        let config = self.config.read();
         let headroom_after = {
-            let cap = (snap_after.total_bytes as f64 * self.config.high_watermark) as u64;
-            let margin = self.config.vram_safety_margin_bytes;
+            let cap = (snap_after.total_bytes as f64 * config.high_watermark) as u64;
+            let margin = config.vram_safety_margin_bytes;
             cap.saturating_sub(snap_after.used_bytes)
                 .saturating_sub(margin)
         };
@@ -276,7 +280,7 @@ impl MemoryPager {
     }
 
     pub fn admit(&self, incoming_bytes: u64) -> Result<()> {
-        if !self.config.preflight_check_enabled {
+        if !self.config.read().preflight_check_enabled {
             return Ok(());
         }
         self.preflight(incoming_bytes)
@@ -312,21 +316,23 @@ impl MemoryPager {
             return;
         }
 
+        let config = self.config.read();
+
         // End a call "pass" and measure against driver-reported usage, not the
         // internal ledger. Lemonade's GlobalVramMonitor drives eviction from
         // real GPU pressure, precisely because the ledger drifts from reality
         // during inference (KV cache growth, activation memory, fragmentation).
-        if snap.utilization_ratio <= self.config.high_watermark {
+        if snap.utilization_ratio <= config.high_watermark {
             return;
         }
 
-        let target_used = (snap.total_bytes as f64 * self.config.low_watermark) as u64;
+        let target_used = (snap.total_bytes as f64 * config.low_watermark) as u64;
         let mut to_free = snap.used_bytes.saturating_sub(target_used);
 
         let candidates = self
             .registry
             .read()
-            .evictable_idle(self.config.idle_offload_after);
+            .evictable_idle(config.idle_offload_after);
 
         for id in candidates {
             if to_free == 0 {
@@ -349,13 +355,24 @@ impl MemoryPager {
 
     pub fn spawn_loop(self: &Arc<Self>) {
         let pager = self.clone();
+        let poll_interval = pager.config.read().poll_interval;
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(pager.config.poll_interval);
+            let mut tick = tokio::time::interval(poll_interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
                 pager.run_maintenance_pass();
             }
         });
+    }
+
+    pub fn update_idle_timeout(&self, timeout: Duration) {
+        self.config.write().idle_offload_after = timeout;
+    }
+
+    pub fn update_watermarks(&self, high_fraction: f64, low_fraction: f64) {
+        let mut config = self.config.write();
+        config.high_watermark = high_fraction;
+        config.low_watermark = low_fraction;
     }
 }

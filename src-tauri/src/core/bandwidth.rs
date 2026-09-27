@@ -21,7 +21,7 @@ impl Default for GovernorConfig {
 /// Lock-free implementation utilizing atomic bit patterns for `f64`.
 #[derive(Debug)]
 pub struct BandwidthGovernor {
-    ceiling_percent: f64,
+    ceiling_bits: AtomicU64,
     max_yield: Duration,
     ema_bits: AtomicU64,
 }
@@ -32,10 +32,18 @@ impl BandwidthGovernor {
     pub fn new(config: GovernorConfig) -> Self {
         let ceiling = config.ceiling_percent.clamp(10.0, 100.0);
         Self {
-            ceiling_percent: ceiling,
+            ceiling_bits: AtomicU64::new(ceiling.to_bits()),
             max_yield: config.max_yield,
             ema_bits: AtomicU64::new(0.0f64.to_bits()),
         }
+    }
+
+    fn ceiling_percent(&self) -> f64 {
+        f64::from_bits(self.ceiling_bits.load(Ordering::Relaxed))
+    }
+
+    fn set_ceiling_percent(&self, value: f64) {
+        self.ceiling_bits.store(value.clamp(10.0, 100.0).to_bits(), Ordering::Relaxed);
     }
 
     pub fn update(&self, memory_bus_percent: f32) {
@@ -67,16 +75,17 @@ impl BandwidthGovernor {
     /// Normalized overload above the ceiling: 0 at/below ceiling, 1 at 100%.
     pub fn pressure(&self) -> f64 {
         let util = self.bus_utilization();
-        if util <= self.ceiling_percent {
+        let ceiling = self.ceiling_percent();
+        if util <= ceiling {
             return 0.0;
         }
 
-        let headroom_span = 100.0 - self.ceiling_percent;
+        let headroom_span = 100.0 - ceiling;
         if headroom_span <= f64::EPSILON {
             return 1.0;
         }
 
-        let p = (util - self.ceiling_percent) / headroom_span;
+        let p = (util - ceiling) / headroom_span;
         if p.is_nan() { 0.0 } else { p.clamp(0.0, 1.0) }
     }
 
@@ -91,6 +100,10 @@ impl BandwidthGovernor {
 
     pub fn snapshot(&self) -> (f64, f64) {
         (self.bus_utilization(), self.pressure())
+    }
+
+    pub fn update_ceiling_percent(&self, percent: f64) {
+        self.set_ceiling_percent(percent);
     }
 }
 

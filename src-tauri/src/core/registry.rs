@@ -9,8 +9,13 @@ use super::engine::ModelHandle;
 pub struct ModelEntry {
     pub spec: ModelSpec,
     pub residency: Residency,
+    pub available: bool,
     pub handle: Option<ModelHandle>,
     pub loaded_at: Instant,
+    /// Wall-clock moment the entry became resident (updated on promote).
+    /// Exposed as `loaded_at_unix` so the UI can show a live, incrementing
+    /// uptime. (`idle_secs` is time-since-last-use, not uptime.)
+    pub loaded_at_unix: u64,
     pub last_used: Instant,
 }
 
@@ -20,8 +25,10 @@ impl ModelEntry {
         Self {
             spec,
             residency: Residency::Cpu,
+            available: false,
             handle: None,
             loaded_at: now,
+            loaded_at_unix: crate::types::unix_now(),
             last_used: now,
         }
     }
@@ -86,6 +93,12 @@ impl Registry {
         self.models.insert(spec.id.clone(), ModelEntry::new(spec));
     }
 
+    pub fn insert_available(&mut self, spec: ModelSpec) {
+        let mut entry = ModelEntry::new(spec.clone());
+        entry.available = true;
+        self.models.insert(spec.id.clone(), entry);
+    }
+
     pub fn remove(&mut self, id: &str) -> Option<ModelEntry> {
         self.models.remove(id)
     }
@@ -94,6 +107,8 @@ impl Registry {
         if let Some(e) = self.models.get_mut(id) {
             e.residency = Residency::Gpu;
             e.handle = Some(handle);
+            e.loaded_at = Instant::now();
+            e.loaded_at_unix = crate::types::unix_now();
             e.last_used = Instant::now();
         }
     }
@@ -118,6 +133,13 @@ impl Registry {
             .filter(|(_, e)| e.residency == Residency::Gpu && e.handle.is_some())
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    pub fn reset_resident(&mut self) {
+        for entry in self.models.values_mut() {
+            entry.handle = None;
+            entry.residency = Residency::Cpu;
+        }
     }
 
     pub fn least_recently_used_resident(&self) -> Option<String> {
@@ -167,11 +189,14 @@ impl Registry {
                 id: e.spec.id.clone(),
                 model_type: e.spec.model_type,
                 residency: e.residency,
+                available: e.available,
                 vram_bytes: match e.residency {
                     Residency::Gpu => e.spec.vram_bytes,
                     Residency::Cpu => 0,
                 },
+                disk_bytes: e.spec.disk_bytes,
                 idle_secs: now.duration_since(e.last_used).as_secs(),
+                loaded_at_unix: e.loaded_at_unix,
             })
             .collect()
     }

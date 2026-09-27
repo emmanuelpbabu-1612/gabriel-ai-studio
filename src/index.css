@@ -99,6 +99,38 @@
   --shadow-soft-hover: 0 16px 48px rgba(0, 0, 0, 0.14), 0 4px 16px rgba(0, 0, 0, 0.08);
 }
 
+/* ════════════════════════════════════════════════════════════
+    UI DENSITY PRESETS
+    ════════════════════════════════════════════════════════════ */
+:root {
+  --font-size-base: 13px;
+  --spacing: 0.25rem;
+}
+
+:root[data-density="compact"] {
+  --font-size-base: 12px;
+  --spacing: 0.225rem;
+  --text-xs: 0.6875rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.9375rem;
+}
+
+:root[data-density="medium"] {
+  --font-size-base: 13px;
+  --spacing: 0.25rem;
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+}
+
+:root[data-density="spacious"] {
+  --font-size-base: 14px;
+  --spacing: 0.275rem;
+  --text-xs: 0.8125rem;
+  --text-sm: 0.9375rem;
+  --text-base: 1.0625rem;
+}
+
 @layer base {
   * {
     border-color: var(--color-border);
@@ -118,9 +150,9 @@
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-    font-size: 13px;
+    font-size: var(--font-size-base, 13px);
     line-height: 1.5;
-    transition: background-color 0.3s ease, color 0.3s ease;
+    transition: background-color 0.3s ease, color 0.3s ease, font-size 0.15s ease;
   }
   * {
     scrollbar-width: none;
@@ -281,16 +313,13 @@
 .number-stepper {
   display: inline-flex;
   align-items: stretch;
-  width: 5rem;
+  width: 5.75rem;
   min-height: 2rem;
   overflow: hidden;
-  border: 1px solid var(--color-border-glass);
-  background-color: var(--color-glass-pill);
-  border-radius: 0.75rem;
 }
 
 .number-stepper-input {
-  width: 3.25rem;
+  flex: 1;
   min-width: 0;
   border: 0;
   outline: 0;
@@ -302,6 +331,18 @@
   font-weight: 700;
   appearance: textfield;
   -moz-appearance: textfield;
+  padding-left: 0.5rem;
+}
+
+.number-stepper-suffix {
+  display: flex;
+  align-items: center;
+  padding-right: 0.125rem;
+  color: var(--color-text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  font-weight: 700;
+  pointer-events: none;
 }
 
 .number-stepper-input::-webkit-outer-spin-button,
@@ -315,7 +356,7 @@
   display: flex;
   flex-direction: column;
   width: 1.5rem;
-  border-left: 1px solid var(--color-border);
+  flex-shrink: 0;
 }
 
 .number-stepper-controls button {
@@ -325,14 +366,14 @@
   justify-content: center;
   padding: 0;
   border: 0;
-  background: var(--color-hover);
+  background: transparent;
   color: var(--color-text-secondary);
   cursor: pointer;
   transition: background-color 0.15s ease, color 0.15s ease;
 }
 
 .number-stepper-controls button:hover {
-  background: var(--color-hover);
+  background: rgba(255, 255, 255, 0.08);
   color: var(--color-text-primary);
 }
 
@@ -597,6 +638,7 @@ button { white-space: nowrap; }
 .badge-secondary{ background-color: var(--color-secondary-bg); color: var(--color-secondary); border: 1px solid rgba(16, 163, 127, 0.25); }
 .badge-tertiary { background-color: var(--color-tertiary-bg);  color: var(--color-tertiary);  border: 1px solid var(--color-border); }
 .badge-gray     { background-color: var(--color-hover);        color: var(--color-text-secondary); border: 1px solid var(--color-border); }
+.badge-gray::before, .pill.badge-gray::before { display: none !important; }
 .badge-green    { background-color: var(--color-secondary-bg); color: var(--color-secondary); border: 1px solid rgba(16, 163, 127, 0.25); }
 .badge-red      { background-color: rgba(239, 68, 68, 0.12);   color: #EF4444;                border: 1px solid rgba(239, 68, 68, 0.25); }
 

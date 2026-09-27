@@ -1,6 +1,7 @@
 import type { FC } from 'react';
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useLocation } from 'react-router-dom';
+import { invoke } from '@tauri-apps/api/core';
 import {
   ChevronRight,
   Plus,
@@ -13,43 +14,37 @@ import {
   Sparkles,
   Zap,
   Square,
+  FileText,
+  X,
+  Loader2,
 } from 'lucide-react';
 import {
   StatusDot,
-  ProgressBar,
   AttachMenuPopover,
 } from '../components/shared';
 import { Select } from '../components/shared/Select';
 import { useCardSpotlight } from '../hooks/useCardSpotlight';
-import {
-  loadedModels,
-  allModels,
-  chatHistory as initialChatHistory,
-} from '../data/mockData';
+import { useAttachment } from '../hooks/useAttachment';
+import { useModels } from '../hooks/useModels';
+import { useChat } from '../hooks/useChat';
+import { useAudioTranscription } from '../hooks/useAudioTranscription';
 
-const llmModels = allModels.filter(m => m.type === 'LLM');
-
-const defaultShortMessages = [
-  {
-    id: '1',
-    role: 'user' as const,
-    content: 'Can you summarize how local AI models execute on hardware?',
-    timestamp: '09:23 AM',
-  },
-  {
-    id: '2',
-    role: 'assistant' as const,
-    content: 'Local AI models run directly on your GPU, CPU, or NPU without sending data to cloud servers. Quantization formats like GGUF and FP16 optimize VRAM usage for real-time inference on consumer hardware.',
-    timestamp: '09:24 AM',
-  },
-];
+interface Message {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: string;
+}
 
 export const Chat: FC = () => {
   const location = useLocation();
   const initialMsgFromHome = location.state?.initialMessage;
 
-  const [selectedModel, setSelectedModel] = useState('llama-3.1-70b');
-  const [messages, setMessages] = useState(() => {
+  const { models } = useModels();
+  const llmModels = models.filter(m => m.model_type === 'llm');
+  
+  const [selectedModel, setSelectedModel] = useState<string>('');
+  const [messages, setMessages] = useState<Message[]>(() => {
     if (initialMsgFromHome) {
       return [
         {
@@ -60,24 +55,51 @@ export const Chat: FC = () => {
         },
       ];
     }
-    return defaultShortMessages;
+    return [];
   });
 
   const [inputValue, setInputValue] = useState('');
-  const [isGenerating, setIsGenerating] = useState(false);
+  // Generation params actually sent to submit_chat (were hardcoded 2048/0.7).
+  const [temperature, setTemperature] = useState('0.7');
+  const [maxTokens, setMaxTokens] = useState('2048');
+  // Measured stats from the last completed response (replaces "Live" placeholders).
+  const [genStats, setGenStats] = useState<{ ttftMs: number | null; tokPerSec: number | null }>({ ttftMs: null, tokPerSec: null });
+  const { attachedFile, setAttachedFile, chooseAttachment } = useAttachment();
   const [showInfoSidebar, setShowInfoSidebar] = useState(true);
   const [activeTab, setActiveTab] = useState<'info' | 'history'>('info');
-  const [historyList, setHistoryList] = useState(initialChatHistory);
+  const [historyList, setHistoryList] = useState<{ id: string; title: string; timestamp: string; messageCount: number }[]>([]);
+  // In-memory per-conversation message store (restored on history click).
+  const [convMessages, setConvMessages] = useState<Record<string, Message[]>>({});
+  const [activeConvId, setActiveConvId] = useState<string | null>(null);
 
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const { 
+    isGenerating, 
+    sendMessage, 
+    stopGeneration,
+    error: chatError 
+  } = useChat();
+
+  const { isRecording, isTranscribing, toggleRecording } = useAudioTranscription((transcribedText) => {
+    setInputValue((prev) => (prev ? `${prev} ${transcribedText}` : transcribedText));
+  });
+
   const { ref: infoCardRef, onPointerMove: onInfoCardPointerMove } = useCardSpotlight();
 
-  const handleNewChat = useCallback(() => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
+  // Initialize selected model from available models
+  useEffect(() => {
+    if (llmModels.length > 0 && !selectedModel) {
+      const runningModel = llmModels.find(m => m.residency === 'gpu');
+      setSelectedModel(runningModel?.id || llmModels[0].id);
     }
-    setIsGenerating(false);
+  }, [llmModels, selectedModel]);
+
+  const handleNewChat = useCallback(() => {
+    stopGeneration();
+    // Persist current thread under the active id before clearing.
+    if (activeConvId) {
+      setConvMessages(prev => ({ ...prev, [activeConvId]: messages }));
+      setHistoryList(prev => prev.map(c => c.id === activeConvId ? { ...c, messageCount: messages.length } : c));
+    }
 
     const newId = Date.now().toString();
     const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -89,9 +111,19 @@ export const Chat: FC = () => {
     };
 
     setHistoryList(prev => [newEntry, ...prev]);
+    setConvMessages(prev => ({ ...prev, [newId]: [] }));
+    setActiveConvId(newId);
     setMessages([]);
     setInputValue('');
-  }, []);
+    setAttachedFile(null);
+  }, [stopGeneration, activeConvId, messages, setAttachedFile]);
+
+  // Keep the active conversation's stored thread in sync as messages stream in.
+  useEffect(() => {
+    if (activeConvId) {
+      setConvMessages(prev => ({ ...prev, [activeConvId]: messages }));
+    }
+  }, [messages, activeConvId]);
 
   // Handle Ctrl+N trigger from global shortcut router
   useEffect(() => {
@@ -100,31 +132,46 @@ export const Chat: FC = () => {
     }
   }, [location.state, handleNewChat]);
 
-  const handleStopGeneration = useCallback(() => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
-    setIsGenerating(false);
-  }, []);
-
   // Contextual shortcut: Ctrl + . to Stop Generation
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === '.') {
         e.preventDefault();
-        handleStopGeneration();
+        stopGeneration();
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleStopGeneration]);
+  }, [stopGeneration]);
 
-  const handleSubmit = (e?: React.FormEvent) => {
+  const handleSubmit = useCallback(async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (inputValue.trim() && !isGenerating) {
-      const userText = inputValue;
-      const newMsg = {
+    if (inputValue.trim() && !isGenerating && selectedModel) {
+      // Read real attachment content so the model receives file data,
+      // not just a filename prefix.
+      let userText = inputValue;
+      const attachedPath = attachedFile;
+      if (attachedPath) {
+        try {
+          const preview = await invoke<{
+            kind: string;
+            name: string;
+            size_bytes: number;
+            text_preview?: string | null;
+          }>('read_attachment_preview', { path: attachedPath });
+          if (preview.kind === 'text' && preview.text_preview) {
+            userText = `[File ${preview.name} content:\n${preview.text_preview}]\n${inputValue}`;
+          } else if (preview.kind === 'image') {
+            userText = `[Image attached: ${preview.name} (${preview.size_bytes} bytes, vision input not yet supported — answering from text only)] ${inputValue}`;
+          } else {
+            userText = `[Attached: ${preview.name} (${preview.size_bytes} bytes)] ${inputValue}`;
+          }
+        } catch (err) {
+          console.error('Attachment read failed, sending filename only', err);
+          userText = `[Attached: ${attachedPath}] ${inputValue}`;
+        }
+      }
+      const newMsg: Message = {
         id: Date.now().toString(),
         role: 'user' as const,
         content: userText,
@@ -132,34 +179,51 @@ export const Chat: FC = () => {
       };
       setMessages(prev => [...prev, newMsg]);
       setInputValue('');
-      setIsGenerating(true);
+      setAttachedFile(null);
 
-      const controller = new AbortController();
-      abortControllerRef.current = controller;
+      // Create placeholder for assistant message
+      const assistantMsgId = (Date.now() + 1).toString();
+      const assistantMsg: Message = {
+        id: assistantMsgId,
+        role: 'assistant' as const,
+        content: '',
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      };
+      setMessages(prev => [...prev, assistantMsg]);
 
-      // Simulated local SSE response with abort signal
-      const timeoutId = setTimeout(() => {
-        if (!controller.signal.aborted) {
-          const assistantMsg = {
-            id: (Date.now() + 1).toString(),
-            role: 'assistant' as const,
-            content: `Gabriel processed your prompt using ${selectedModel} in 120ms at 42.8 t/s.`,
-            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          };
-          setMessages(prev => [...prev, assistantMsg]);
+      // Stream the response (params come from the editable Session Info controls)
+      const t0 = performance.now();
+      let firstTokenAt = 0;
+      let tokenCount = 0;
+      const parsedTemp = Math.min(2, Math.max(0, Number(temperature) || 0.7));
+      const parsedMaxTokens = Math.min(8192, Math.max(1, Math.floor(Number(maxTokens) || 2048)));
+      sendMessage(
+        selectedModel,
+        userText,
+        { max_tokens: parsedMaxTokens, temperature: parsedTemp },
+        (token) => {
+          if (!firstTokenAt) firstTokenAt = performance.now();
+          tokenCount += 1;
+          setMessages(prev => prev.map(msg => 
+            msg.id === assistantMsgId ? { ...msg, content: msg.content + token } : msg
+          ));
+        },
+        (finishReason) => {
+          const doneAt = performance.now();
+          setGenStats({
+            ttftMs: firstTokenAt ? firstTokenAt - t0 : null,
+            tokPerSec: doneAt > t0 ? tokenCount / ((doneAt - t0) / 1000) : null,
+          });
+          console.log('Chat finished:', finishReason);
+        },
+        (error) => {
+          setMessages(prev => prev.map(msg => 
+            msg.id === assistantMsgId ? { ...msg, content: `Error: ${error}` } : msg
+          ));
         }
-        setIsGenerating(false);
-        abortControllerRef.current = null;
-      }, 1200);
-
-      controller.signal.addEventListener('abort', () => {
-        clearTimeout(timeoutId);
-        setIsGenerating(false);
-      });
+      );
     }
-  };
-
-  const currentModel = loadedModels[0];
+  }, [inputValue, isGenerating, selectedModel, attachedFile, sendMessage, temperature, maxTokens]);
 
   return (
     <div className="flex flex-col h-full max-w-6xl mx-auto space-y-4 text-text-primary">
@@ -168,7 +232,7 @@ export const Chat: FC = () => {
         {/* Left: Model Selector */}
         <div className="flex items-center gap-3">
           <Select
-            options={llmModels.map(m => ({ value: m.id, label: m.name }))}
+            options={llmModels.map(m => ({ value: m.id, label: m.id }))}
             value={selectedModel}
             onChange={setSelectedModel}
             className="w-64"
@@ -202,8 +266,22 @@ export const Chat: FC = () => {
           </button>
 
           <button
+            onClick={() => {
+              const md = messages
+                .map((m) => `## ${m.role === 'user' ? 'User' : 'Gabriel'} (${m.timestamp})\n\n${m.content}\n`)
+                .join('\n---\n\n');
+              const blob = new Blob([`# Gabriel Chat Export\n\n${md}`], { type: 'text/markdown' });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = `gabriel-chat-${Date.now()}.md`;
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              setTimeout(() => URL.revokeObjectURL(url), 1000);
+            }}
             className="p-2.5 rounded-xl text-text-secondary hover:bg-[var(--color-hover)] hover:text-text-primary active:scale-90 transition-all cursor-pointer"
-            title="Export"
+            title="Export conversation as Markdown"
             aria-label="Export"
           >
             <Download size={18} strokeWidth={2} />
@@ -244,8 +322,28 @@ export const Chat: FC = () => {
 
           {/* Floating Glass Input */}
           <form onSubmit={handleSubmit} className="p-3 bg-transparent">
+            {chatError && (
+              <div className="mb-2 rounded-xl border border-red-400/30 bg-red-400/10 px-3 py-2 text-[11px] text-red-200">
+                {chatError}
+              </div>
+            )}
             <div className="flex items-center gap-2 rounded-full glass-floating dynamic-glass-pill pl-3 pr-3.5 py-2.5 focus-within:ring-2 focus-within:ring-primary/20 transition-all">
-              <AttachMenuPopover iconSize={16} />
+              <AttachMenuPopover iconSize={16} onSelect={chooseAttachment} />
+
+              {attachedFile && (
+                <span className="flex items-center gap-1 rounded-full bg-[var(--color-primary-bg)] px-2 py-1 text-[10px] font-mono text-primary max-w-48 shrink-0">
+                  <FileText size={12} />
+                  <span className="truncate">{attachedFile.split(/[\\/]/).pop()}</span>
+                  <button
+                    type="button"
+                    onClick={() => setAttachedFile(null)}
+                    className="ml-0.5 hover:text-text-primary"
+                    aria-label="Remove attachment"
+                  >
+                    <X size={11} />
+                  </button>
+                </span>
+              )}
 
               <input
                 type="text"
@@ -263,16 +361,24 @@ export const Chat: FC = () => {
 
               <button
                 type="button"
-                className="p-1.5 rounded-full text-text-secondary hover:text-primary active:scale-90 transition-all cursor-pointer shrink-0"
+                onClick={toggleRecording}
+                title={isRecording ? 'Stop recording voice prompt' : isTranscribing ? 'Transcribing...' : 'Record voice prompt'}
                 aria-label="Voice input"
+                className={`p-1.5 rounded-full transition-all shrink-0 cursor-pointer ${
+                  isRecording
+                    ? 'bg-rose-500/20 text-rose-500 animate-pulse ring-1 ring-rose-500'
+                    : isTranscribing
+                    ? 'text-primary animate-spin'
+                    : 'text-text-secondary hover:text-text-primary hover:bg-[var(--color-hover)]'
+                }`}
               >
-                <Mic size={16} strokeWidth={1.5} />
+                {isTranscribing ? <Loader2 size={16} className="animate-spin" /> : <Mic size={16} strokeWidth={1.8} />}
               </button>
 
               {isGenerating ? (
                 <button
                   type="button"
-                  onClick={handleStopGeneration}
+                  onClick={stopGeneration}
                   className="p-1.5 text-white bg-primary rounded-full hover:scale-105 active:scale-95 transition-all cursor-pointer shrink-0"
                   aria-label="Stop generation (Ctrl+.)"
                   title="Stop generation (Ctrl+.)"
@@ -282,7 +388,7 @@ export const Chat: FC = () => {
               ) : (
                 <button
                   type="submit"
-                  disabled={!inputValue.trim()}
+                  disabled={!inputValue.trim() && !attachedFile}
                   className="p-1.5 text-white bg-primary rounded-full disabled:opacity-40 disabled:hover:scale-100 hover:scale-105 active:scale-95 transition-all cursor-pointer shrink-0"
                   aria-label="Send (Ctrl+Enter)"
                   title="Send (Ctrl+Enter)"
@@ -329,41 +435,87 @@ export const Chat: FC = () => {
                     Model Details
                   </div>
                   <div className="p-3 bg-[var(--color-hover)] rounded-xl space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-text-secondary font-medium">Model</span>
-                      <span className="font-bold text-text-primary truncate max-w-[120px]">{currentModel.name}</span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-text-secondary font-medium">Quantization</span>
-                      <span className="badge badge-primary font-mono font-bold">{currentModel.quantization}</span>
-                    </div>
-                  </div>
-
-                  <div>
-                    <div className="flex justify-between text-text-secondary mb-1 font-medium">
-                      <span>Context Window</span>
-                      <span className="font-mono text-text-primary font-bold">3.2K / 8K</span>
-                    </div>
-                    <ProgressBar value={3200} max={8000} color="primary" height={4} />
+                    {(() => {
+                      const model = models.find(m => m.id === selectedModel);
+                      if (!model) return (
+                        <div className="text-text-secondary text-center py-4">Select a model to see details</div>
+                      );
+                      return (
+                        <>
+                          <div className="flex items-center justify-between">
+                            <span className="text-text-secondary font-medium">Model</span>
+                            <span className="font-bold text-text-primary truncate max-w-[120px]">{model.id}</span>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-text-secondary font-medium">Type</span>
+                            <span className="badge badge-primary font-mono font-bold">{model.model_type.toUpperCase()}</span>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-text-secondary font-medium">Status</span>
+                            <span className={`badge ${model.residency === 'gpu' ? 'badge-secondary' : 'badge-tertiary'} font-mono font-bold`}>
+                              {model.residency === 'gpu' ? 'Running (VRAM)' : model.available ? 'Offloaded (RAM)' : 'Available'}
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-text-secondary font-medium">VRAM</span>
+                            <span className="font-mono text-text-primary font-bold">
+                              {(model.vram_bytes / 1024 ** 3).toFixed(1)} GB
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-text-secondary font-medium">Disk</span>
+                            <span className="font-mono text-text-primary font-bold">
+                              {(model.disk_bytes / 1024 ** 3).toFixed(1)} GB
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-text-secondary font-medium">Idle</span>
+                            <span className="font-mono text-text-secondary font-bold">
+                              {model.idle_secs > 3600 
+                                ? `${Math.floor(model.idle_secs / 3600)}h` 
+                                : model.idle_secs > 60 
+                                  ? `${Math.floor(model.idle_secs / 60)}m` 
+                                  : `${model.idle_secs}s`}
+                            </span>
+                          </div>
+                        </>
+                      );
+                    })()}
                   </div>
 
                   <div className="space-y-1.5 pt-2 border-t border-[var(--color-border)] font-medium">
-                    <div className="flex justify-between text-text-secondary">
+                    <div className="flex justify-between items-center text-text-secondary">
                       <span>Temperature</span>
-                      <span className="font-mono text-text-primary font-bold">0.7</span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={2}
+                        step={0.1}
+                        value={temperature}
+                        onChange={(e) => setTemperature(e.target.value)}
+                        className="w-20 glass-pill px-2 py-1 text-xs font-mono text-text-primary text-right focus:outline-none focus:ring-2 focus:ring-primary/20"
+                        aria-label="Temperature"
+                        title="Sampling temperature actually sent with each request (0–2)"
+                      />
                     </div>
-                    <div className="flex justify-between text-text-secondary">
-                      <span>Top P</span>
-                      <span className="font-mono text-text-primary font-bold">0.9</span>
-                    </div>
-                    <div className="flex justify-between text-text-secondary">
+                    <div className="flex justify-between items-center text-text-secondary">
                       <span>Max Tokens</span>
-                      <span className="font-mono text-text-primary font-bold">2048</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={8192}
+                        step={1}
+                        value={maxTokens}
+                        onChange={(e) => setMaxTokens(e.target.value)}
+                        className="w-20 glass-pill px-2 py-1 text-xs font-mono text-text-primary text-right focus:outline-none focus:ring-2 focus:ring-primary/20"
+                        aria-label="Max tokens"
+                        title="Max tokens actually sent with each request (1–8192)"
+                      />
                     </div>
                   </div>
                 </div>
 
-                {/* Session Real-time Speed */}
+                {/* Session Real-time Speed (measured from the last response) */}
                 <div className="pt-3 border-t border-[var(--color-border)] space-y-2">
                   <div className="font-bold text-text-primary flex items-center gap-1.5">
                     <Zap size={14} className="text-secondary" />
@@ -371,12 +523,16 @@ export const Chat: FC = () => {
                   </div>
                   <div className="grid grid-cols-2 gap-2 text-center">
                     <div className="p-2 rounded-xl bg-[var(--color-hover)]">
-                      <span className="text-[10px] text-text-secondary font-semibold uppercase block">Speed</span>
-                      <span className="font-mono font-bold text-sm text-secondary">42.8 t/s</span>
+                      <span className="text-[10px] text-text-secondary font-semibold uppercase block">Throughput</span>
+                      <span className="font-mono font-bold text-sm text-secondary">
+                        {genStats.tokPerSec != null ? `${genStats.tokPerSec.toFixed(1)} tok/s` : '—'}
+                      </span>
                     </div>
                     <div className="p-2 rounded-xl bg-[var(--color-hover)]">
-                      <span className="text-[10px] text-text-secondary font-semibold uppercase block">Latency</span>
-                      <span className="font-mono font-bold text-sm text-primary">120 ms</span>
+                      <span className="text-[10px] text-text-secondary font-semibold uppercase block">First token</span>
+                      <span className="font-mono font-bold text-sm text-primary">
+                        {genStats.ttftMs != null ? `${(genStats.ttftMs / 1000).toFixed(2)}s` : '—'}
+                      </span>
                     </div>
                   </div>
                 </div>
@@ -384,10 +540,20 @@ export const Chat: FC = () => {
             ) : (
               <div className="space-y-2 text-xs relative z-10">
                 <div className="font-bold text-text-primary mb-2">Chat History</div>
+                {historyList.length === 0 && (
+                  <p className="text-[11px] text-text-secondary italic">No conversations yet — start chatting.</p>
+                )}
                 {historyList.map(conv => (
                   <button
                     key={conv.id}
-                    onClick={() => setMessages([])}
+                    onClick={() => {
+                      stopGeneration();
+                      if (activeConvId) {
+                        setConvMessages(prev => ({ ...prev, [activeConvId]: messages }));
+                      }
+                      setActiveConvId(conv.id);
+                      setMessages(convMessages[conv.id] ?? []);
+                    }}
                     className="w-full flex items-center justify-between p-2.5 rounded-xl bg-[var(--color-hover)] hover:bg-[var(--color-active)] transition-all text-left group cursor-pointer"
                   >
                     <div className="flex-1 min-w-0 pr-2">
@@ -406,7 +572,7 @@ export const Chat: FC = () => {
   );
 };
 
-const MessageBubble: FC<{ message: typeof defaultShortMessages[0] }> = ({ message }) => {
+const MessageBubble: FC<{ message: Message }> = ({ message }) => {
   const isUser = message.role === 'user';
 
   return (

@@ -1,4 +1,4 @@
-use sysinfo::System;
+use sysinfo::{System, MINIMUM_CPU_UPDATE_INTERVAL};
 
 #[derive(Debug)]
 pub struct SystemSampler {
@@ -14,30 +14,22 @@ impl Default for SystemSampler {
 impl SystemSampler {
     pub fn new() -> Self {
         let mut sys = System::new();
-        sys.refresh_memory();
+        // CPU usage is a delta between two refreshes, so prime it once.
         sys.refresh_cpu_usage();
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        sys.refresh_memory();
+        std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
         sys.refresh_cpu_usage();
         Self { sys }
     }
 
-    pub fn refresh(&mut self) {
-        self.sys.refresh_memory();
-    }
-
-    pub fn refresh_cpu(&mut self) {
+    /// Refresh CPU + memory and return (cpu_percent, total_ram_bytes, used_ram_bytes).
+    pub fn sample(&mut self) -> (f32, u64, u64) {
         self.sys.refresh_cpu_usage();
-    }
-
-    pub fn total_ram_bytes(&self) -> u64 {
-        self.sys.total_memory()
-    }
-
-    pub fn used_ram_bytes(&self) -> u64 {
-        self.sys.used_memory()
-    }
-
-    pub fn cpu_usage(&self) -> f32 {
-        self.sys.global_cpu_usage()
+        self.sys.refresh_memory();
+        (
+            self.sys.global_cpu_usage(),
+            self.sys.total_memory(),
+            self.sys.used_memory(),
+        )
     }
 }

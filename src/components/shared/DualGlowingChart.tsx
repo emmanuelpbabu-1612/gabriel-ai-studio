@@ -7,12 +7,16 @@ const PAD_BOTTOM = 10;
 
 type Coord = { x: number; y: number };
 
-function mapDataToCoords(data: number[], maxValue: number): Coord[] {
-  const stepX = SVG_W / (data.length - 1);
+function mapDataToCoords(data: number[], loValue: number, hiValue: number): Coord[] {
+  if (data.length === 0) return [];
+  const stepX = data.length > 1 ? SVG_W / (data.length - 1) : 0;
   const usableH = SVG_H - PAD_TOP - PAD_BOTTOM;
+  const span = hiValue - loValue;
   return data.map((val, i) => ({
     x: i * stepX,
-    y: PAD_TOP + (usableH - (val / maxValue) * usableH),
+    y: span > 0
+      ? PAD_TOP + (usableH - ((val - loValue) / span) * usableH)
+      : PAD_TOP + usableH / 2, // genuinely constant data: honest flat midline
   }));
 }
 
@@ -122,10 +126,19 @@ export const DualGlowingChart: FC<DualGlowingChartProps> = ({
     const svg = svgRef.current;
     if (!svg) return;
 
-    const maxVal = Math.max(...primaryData, ...secondaryData, 10);
+    // Autoscale to the visible data range (with padding) instead of [0, max]:
+    // real sub-GB RAM fluctuations are sub-pixel on a zero-based scale and
+    // render as a fake flat line. Genuinely constant data still draws flat —
+    // at mid-chart, which is the honest signal for "no variation".
+    const all = [...primaryData, ...secondaryData].filter((v) => Number.isFinite(v));
+    let lo = all.length > 0 ? Math.min(...all) : 0;
+    let hi = all.length > 0 ? Math.max(...all) : 1;
+    const pad = (hi - lo) * 0.15 || Math.max(Math.abs(hi) * 0.05, 1e-6);
+    lo -= pad;
+    hi += pad;
 
-    const coordsPrimary = mapDataToCoords(primaryData, maxVal);
-    const coordsSecondary = mapDataToCoords(secondaryData, maxVal);
+    const coordsPrimary = mapDataToCoords(primaryData, lo, hi);
+    const coordsSecondary = mapDataToCoords(secondaryData, lo, hi);
 
     const linePrimary = svg.getElementById('line-primary') as SVGPathElement | null;
     const areaPrimary = svg.getElementById('area-primary') as SVGPathElement | null;

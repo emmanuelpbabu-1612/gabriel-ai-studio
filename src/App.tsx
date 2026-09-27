@@ -9,9 +9,11 @@ import { System } from './pages/System';
 import { Settings } from './pages/Settings';
 import { useAccentTheme, AccentThemeProvider } from './hooks/useAccentTheme';
 import { useTheme, ThemeProvider } from './hooks/useTheme';
+import { useDensity, DensityProvider } from './hooks/useDensity';
 
 function AppContent() {
   useAccentTheme();
+  useDensity();
   const { isDark } = useTheme();
 
   return (
@@ -37,7 +39,9 @@ function App() {
   return (
     <ThemeProvider>
       <AccentThemeProvider>
-        <AppContent />
+        <DensityProvider>
+          <AppContent />
+        </DensityProvider>
       </AccentThemeProvider>
     </ThemeProvider>
   );

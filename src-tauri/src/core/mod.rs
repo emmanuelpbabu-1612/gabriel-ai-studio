@@ -3,6 +3,7 @@ pub mod engine;
 pub mod pager;
 pub mod registry;
 pub mod scheduler;
+pub mod settings;
 
 use std::time::Duration;
 

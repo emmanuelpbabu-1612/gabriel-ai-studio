@@ -1,10 +1,9 @@
 import type { FC } from 'react';
-import { useState, useRef } from 'react';
+import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
   Play,
   Settings,
-  Paperclip,
   Mic,
   ArrowRight,
   MessageSquare,
@@ -13,6 +12,7 @@ import {
   Sparkles,
   SlidersHorizontal,
   FileText,
+  Loader2,
 } from 'lucide-react';
 import {
   StatusDot,
@@ -21,24 +21,28 @@ import {
   AttachMenuPopover,
 } from '../components/shared';
 import { TopSearchBar } from '../components/layout/TopSearchBar';
-import { AudioWaveformRecorder } from '../components/shared/AudioWaveformRecorder';
-import {
-  user,
-  engineMode,
-  loadedModels as initialLoadedModels,
-  quickActions,
-} from '../data/mockData';
+import { quickActions } from '../data/mockData';
 import { useCardSpotlight } from '../hooks/useCardSpotlight';
+import { useModels } from '../hooks/useModels';
+import { useTelemetry } from '../hooks/useTelemetry';
+import { useAttachment } from '../hooks/useAttachment';
+import { useEngineMode, usePagerStatus, useProfile } from '../hooks/useEngineSettings';
+import { useAudioTranscription } from '../hooks/useAudioTranscription';
+import { Select } from '../components/shared/Select';
 
 export const Home: FC = () => {
   const navigate = useNavigate();
-  const [workloads, setWorkloads] = useState(initialLoadedModels);
-  const [smartSwapActive, setSmartSwapActive] = useState(true);
   const [stickyInput, setStickyInput] = useState('');
-  const [, setSentMessages] = useState<string[]>([]);
-  const [attachedFileName, setAttachedFileName] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const [isRecordingMic, setIsRecordingMic] = useState(false);
+  const { models, loadingId, load, unload } = useModels();
+  const telemetry = useTelemetry();
+  const { attachedFile, setAttachedFile, chooseAttachment } = useAttachment();
+  const { name } = useProfile();
+  const { mode, updateMode } = useEngineMode();
+  const pagerStatus = usePagerStatus();
+
+  const { isRecording, isTranscribing, toggleRecording } = useAudioTranscription((transcribedText) => {
+    setStickyInput((prev) => (prev ? `${prev} ${transcribedText}` : transcribedText));
+  });
 
   const { ref: greetingRef, onPointerMove: onGreetingPointerMove } = useCardSpotlight();
   const { ref: workloadsRef, onPointerMove: onWorkloadsPointerMove } = useCardSpotlight();
@@ -50,52 +54,20 @@ export const Home: FC = () => {
     return 'Good evening';
   };
 
-  const activeCount = workloads.filter(w => w.status === 'running').length;
-
-  const toggleWorkloadState = (id: string) => {
-    setWorkloads(prev =>
-      prev.map(item => {
-        if (item.id === id) {
-          const isCurrentlyRunning = item.status === 'running';
-          return {
-            ...item,
-            status: isCurrentlyRunning ? ('idle' as const) : ('running' as const),
-            uptime: isCurrentlyRunning ? '00:00:00' : '00:00:01',
-            vramUsed: isCurrentlyRunning ? 0.0 : item.vramRequired,
-          };
-        }
-        return item;
-      })
-    );
-  };
-
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      setAttachedFileName(e.target.files[0].name);
-    }
-  };
+  const activeCount = models.filter(model => model.residency === 'gpu').length;
 
   const handleStickySubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (stickyInput.trim() || attachedFileName) {
-      const fullText = attachedFileName ? `[Attached: ${attachedFileName}] ${stickyInput}` : stickyInput;
-      setSentMessages(prev => [...prev, fullText]);
+    if (stickyInput.trim() || attachedFile) {
+      const fullText = attachedFile ? `[Attached: ${attachedFile}] ${stickyInput}` : stickyInput;
       setStickyInput('');
-      setAttachedFileName(null);
+      setAttachedFile(null);
       navigate('/chat', { state: { initialMessage: fullText } });
     }
   };
 
   return (
     <div className="space-y-6 max-w-5xl mx-auto pb-28 text-text-primary select-none">
-      <input
-        ref={fileInputRef}
-        type="file"
-        onChange={handleFileChange}
-        className="hidden"
-        aria-label="Upload file"
-      />
-
       <TopSearchBar />
 
       {/* Greeting Banner */}
@@ -106,10 +78,10 @@ export const Home: FC = () => {
       >
         <div className="relative z-10">
           <h1 className="text-2xl md:text-3xl font-bold text-text-primary mb-2 tracking-tight">
-            {getGreeting()}, {user.name.split(' ')[0]}.
+            {getGreeting()}, {name.split(' ')[0]}.
           </h1>
           <p className="text-sm md:text-base text-text-secondary font-medium">
-            Your local AI engine is active and ready on device.
+            {telemetry ? 'Your local AI engine is active and ready on device.' : 'Connecting to your local AI engine...'}
           </p>
         </div>
       </div>
@@ -140,8 +112,10 @@ export const Home: FC = () => {
         </div>
 
         <div className="space-y-2.5">
-          {workloads.map(model => {
-            const isRunning = model.status === 'running';
+          {models.map(model => {
+            const isRunning = model.residency === 'gpu';
+            const isOffloaded = model.residency === 'cpu';
+            const type = model.model_type === 'llm' || model.model_type === 'embedding' ? 'LLM' : model.model_type === 'image' ? 'Image' : 'Voice';
 
             return (
               <div
@@ -149,36 +123,37 @@ export const Home: FC = () => {
                 className="flex items-center gap-4 p-3 rounded-2xl bg-[var(--color-hover)]/40 hover:bg-[var(--color-hover)] transition-all border border-transparent hover:border-[var(--color-border)] dynamic-glass-pill"
               >
                 <div className="flex-shrink-0">
-                  <ModelBadge type={model.type} status={model.status} size="sm" />
+                  <ModelBadge type={type} status={isRunning ? 'running' : 'idle'} size="sm" />
                 </div>
 
                 <div className="flex-1 min-w-0">
-                  <div className="font-bold text-sm text-text-primary truncate">{model.name}</div>
-                  <div className="text-xs text-text-secondary truncate">{model.role}</div>
+                  <div className="font-bold text-sm text-text-primary truncate">{model.id}</div>
+                  <div className="text-xs text-text-secondary truncate">{isOffloaded ? 'Paged to RAM' : 'Loaded workload'}</div>
                 </div>
 
                 <div className="hidden sm:flex items-center gap-2 text-xs font-medium min-w-[130px]">
                   <StatusDot status={isRunning ? 'running' : 'idle'} size={6} />
                   <span className={isRunning ? 'text-secondary font-bold' : 'text-text-secondary'}>
-                    {isRunning ? `Running · ${model.uptime}` : 'Idle · Ready'}
+                    {isRunning ? 'Running' : 'Offloaded · Ready'}
                   </span>
                 </div>
 
                 <div className="text-xs font-mono text-text-secondary w-24 text-right font-semibold">
-                  {model.vramUsed.toFixed(1)} GB VRAM
+                  {(model.vram_bytes / 1024 ** 3).toFixed(1)} GB VRAM
                 </div>
 
                 <div className="hidden md:block flex-shrink-0">
                   <RadialGraph
-                    percent={isRunning ? (model.type === 'LLM' ? 78 : model.type === 'Image' ? 85 : 62) : 0}
-                    preset={model.type === 'LLM' ? 'cpu' : model.type === 'Image' ? 'gpu' : 'cpu'}
+                    percent={isRunning ? Math.round(telemetry?.gpu_load ?? 0) : 0}
+                    preset={type === 'Image' ? 'gpu' : 'cpu'}
                     size={44}
                     showCenterText={true}
                   />
                 </div>
 
                 <button
-                  onClick={() => toggleWorkloadState(model.id)}
+                  onClick={() => (isRunning ? unload(model.id) : load(model.id, model.model_type)).catch(console.error)}
+                  disabled={loadingId === model.id}
                   className={`p-2 rounded-full transition-colors cursor-pointer ${
                     isRunning
                       ? 'text-text-secondary hover:bg-[var(--color-hover)] hover:text-text-primary'
@@ -202,16 +177,26 @@ export const Home: FC = () => {
             <div className="flex items-center gap-2">
               <SlidersHorizontal size={14} className="text-text-secondary" />
               <span className="text-text-secondary">Engine Governor Mode:</span>
-              <span className="font-bold text-text-primary">{engineMode}</span>
+              <Select
+                options={[
+                  { value: 'balanced', label: 'Balanced' },
+                  { value: 'performance', label: 'Performance' },
+                  { value: 'efficiency', label: 'Efficiency' },
+                ]}
+                value={mode}
+                onChange={(value) => updateMode(value as typeof mode).catch(console.error)}
+                className="w-32"
+              />
             </div>
 
             <div className="flex items-center gap-4">
               <button
-                onClick={() => setSmartSwapActive(!smartSwapActive)}
-                className="flex items-center gap-1.5 font-semibold text-secondary hover:opacity-80 transition-opacity cursor-pointer dynamic-glass-pill px-3 py-1"
+                onClick={() => navigate('/system')}
+                title="View System telemetry"
+                className="flex items-center gap-1.5 font-semibold text-secondary dynamic-glass-pill px-3 py-1 cursor-pointer"
               >
-                <StatusDot status={smartSwapActive ? 'running' : 'idle'} size={6} />
-                <span>VRAM Pager: {smartSwapActive ? 'Active' : 'Off'}</span>
+                <StatusDot status={pagerStatus === 'active' ? 'running' : 'warning'} size={6} />
+                <span>VRAM Pager: {pagerStatus[0].toUpperCase() + pagerStatus.slice(1)}</span>
               </button>
 
               <button
@@ -234,18 +219,16 @@ export const Home: FC = () => {
         <div className="max-w-4xl mx-auto glass-floating dynamic-glass-pill p-2.5 shadow-2xl flex items-center gap-2 focus-within:ring-2 focus-within:ring-primary/20 transition-all">
           <AttachMenuPopover
             iconSize={18}
-            onSelect={() => {
-              fileInputRef.current?.click();
-            }}
+            onSelect={chooseAttachment}
           />
 
-          {attachedFileName && (
+          {attachedFile && (
             <span className="badge badge-primary font-mono text-[10px] shrink-0 dynamic-glass-pill">
               <FileText size={12} />
-              {attachedFileName}
+              {attachedFile.split(/[\\/]/).pop()}
               <button
                 type="button"
-                onClick={() => setAttachedFileName(null)}
+                onClick={() => setAttachedFile(null)}
                 className="ml-1 text-primary hover:text-text-primary cursor-pointer"
               >
                 ×
@@ -261,26 +244,25 @@ export const Home: FC = () => {
             className="flex-1 bg-transparent border-none focus:outline-none text-xs font-semibold text-text-primary placeholder:text-text-secondary"
           />
 
-          {isRecordingMic ? (
-            <AudioWaveformRecorder
-              onStop={() => setIsRecordingMic(false)}
-              onCancel={() => setIsRecordingMic(false)}
-            />
-          ) : (
-            <button
-              type="button"
-              onClick={() => setIsRecordingMic(true)}
-              className="p-2 rounded-full text-text-secondary hover:text-text-primary transition-colors cursor-pointer shrink-0"
-              aria-label="Voice input"
-              title="Start voice input"
-            >
-              <Mic size={17} strokeWidth={1.5} />
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={toggleRecording}
+            title={isRecording ? 'Stop recording voice prompt' : isTranscribing ? 'Transcribing...' : 'Record voice prompt'}
+            aria-label="Voice input"
+            className={`p-2 rounded-full transition-all shrink-0 cursor-pointer ${
+              isRecording
+                ? 'bg-rose-500/20 text-rose-500 animate-pulse ring-1 ring-rose-500'
+                : isTranscribing
+                ? 'text-primary animate-spin'
+                : 'text-text-secondary hover:text-text-primary hover:bg-[var(--color-hover)]'
+            }`}
+          >
+            {isTranscribing ? <Loader2 size={17} className="animate-spin" /> : <Mic size={17} strokeWidth={1.8} />}
+          </button>
 
           <button
             type="submit"
-            disabled={!stickyInput.trim() && !attachedFileName}
+            disabled={!stickyInput.trim() && !attachedFile}
             className="p-2 text-white bg-primary rounded-full disabled:opacity-40 disabled:hover:scale-100 hover:scale-105 active:scale-95 transition-all cursor-pointer shrink-0"
             aria-label="Send message"
           >
@@ -313,8 +295,8 @@ const QuickActionCard: FC<{ action: typeof quickActions[0] }> = ({ action }) => 
 
   return (
     <Link
-      ref={ref}
-      onPointerMove={onPointerMove}
+      ref={ref as any}
+      onPointerMove={onPointerMove as any}
       to={action.route}
       className="glass-panel aurora-glass dynamic-glass-card p-4 flex flex-col justify-between group cursor-pointer hover:-translate-y-1 transition-all"
     >

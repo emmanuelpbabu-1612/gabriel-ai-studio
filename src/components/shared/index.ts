@@ -7,6 +7,8 @@ export { RadialGraph } from './RadialGraph';
 export { GlobalGradients } from './GlobalGradients';
 export { GlowingAreaChart } from './GlowingAreaChart';
 export { DualGlowingChart } from './DualGlowingChart';
+export { TimeSeriesChart } from './TimeSeriesChart';
+export type { TsPoint, TsSeriesInput } from './TimeSeriesChart';
 export { ProgressBar } from './ProgressBar';
 export { ModelBadge } from './ModelBadge';
 export { RightPanelCard } from './RightPanelCard';

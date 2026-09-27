@@ -31,10 +31,14 @@ pub async fn audio_speech(
     let model_id = req.model.clone();
     let voice = req.voice.unwrap_or_else(|| "alloy".into());
 
-    let rx = engine
-        .submit_speech(&model_id, req.input.clone(), voice)
-        .await
-        .map_err(ApiError)?;
+    let rx = match engine.submit_speech(&model_id, req.input.clone(), voice.clone()).await {
+        Ok(rx) => rx,
+        Err(GabrielError::ModelNotLoaded(_)) => {
+            engine.load_model(&model_id, crate::types::ModelType::Tts, None).await.map_err(ApiError)?;
+            engine.submit_speech(&model_id, req.input.clone(), voice).await.map_err(ApiError)?
+        }
+        Err(e) => return Err(ApiError(e)),
+    };
 
     let wav = rx
         .await

@@ -5,15 +5,19 @@ pub struct GpuSample {
     pub used_bytes: u64,
     pub utilization_percent: f32,
     pub memory_bandwidth_percent: f32,
+    pub temperature_c: Option<f32>,
+    pub power_w: Option<f32>,
+    pub fan_percent: Option<u32>,
 }
 
-pub trait GpuMonitor: std::fmt::Debug {
+pub trait GpuMonitor: std::fmt::Debug + Send + Sync {
     fn sample(&self) -> GpuSample;
 }
 
 #[cfg(all(not(target_os = "macos"), feature = "nvml"))]
 mod nvml_monitor {
     use super::{GpuMonitor, GpuSample};
+    use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
     use nvml_wrapper::Nvml;
     use parking_lot::Mutex;
 
@@ -36,27 +40,41 @@ mod nvml_monitor {
             let Ok(device) = guard.device_by_index(0) else {
                 return GpuSample::default();
             };
+
             let name = device
                 .name()
                 .unwrap_or_else(|_| "unknown-nvidia-gpu".to_string());
-            let Some(mem) = device.memory_info().ok() else {
-                return GpuSample {
-                    name,
-                    ..GpuSample::default()
-                };
-            };
-            let util = device
+
+            let (total_bytes, used_bytes) = device
+                .memory_info()
+                .map(|m| (m.total, m.used))
+                .unwrap_or((0, 0));
+
+            let (gpu_util, mem_util) = device
                 .utilization_rates()
                 .map(|u| (u.gpu as f32, u.memory as f32))
                 .unwrap_or((0.0, 0.0));
+
             GpuSample {
                 name,
-                total_bytes: mem.total,
-                used_bytes: mem.used,
-                utilization_percent: util.0,
-                memory_bandwidth_percent: util.1,
+                total_bytes,
+                used_bytes,
+                utilization_percent: gpu_util,
+                memory_bandwidth_percent: mem_util,
+                temperature_c: device
+                    .temperature(TemperatureSensor::Gpu)
+                    .ok()
+                    .map(|t| t as f32),
+                // NVML reports milliwatts
+                power_w: device.power_usage().ok().map(|mw| mw as f32 / 1000.0),
+                // Percentage of max fan speed, NOT RPM
+                fan_percent: device.fan_speed(0).ok(),
             }
         }
+    }
+
+    pub fn create() -> Option<Box<dyn GpuMonitor>> {
+        NvmlMonitor::new().map(|m| Box::new(m) as Box<dyn GpuMonitor>)
     }
 }
 
@@ -83,9 +101,13 @@ mod metal_monitor {
                 name: device.name().to_string(),
                 total_bytes: device.recommended_max_working_set_size(),
                 used_bytes: device.current_allocated_size(),
-                utilization_percent: 0.0,
+                ..GpuSample::default()
             }
         }
+    }
+
+    pub fn create() -> Option<Box<dyn GpuMonitor>> {
+        MetalMonitor::new().map(|m| Box::new(m) as Box<dyn GpuMonitor>)
     }
 }
 
@@ -95,23 +117,33 @@ pub struct FallbackMonitor;
 impl GpuMonitor for FallbackMonitor {
     fn sample(&self) -> GpuSample {
         GpuSample {
-            name: "unified-memory".to_string(),
+            name: "no-gpu-backend".to_string(),
             ..GpuSample::default()
         }
     }
 }
 
-pub fn probe() -> Box<dyn GpuMonitor + Send + Sync> {
-    #[cfg(all(not(target_os = "macos"), feature = "nvml"))]
-    if let Some(m) = nvml_monitor::NvmlMonitor::new() {
-        return Box::new(m);
-    }
+#[cfg(all(not(target_os = "macos"), feature = "nvml"))]
+fn platform_probe() -> Option<Box<dyn GpuMonitor>> {
+    nvml_monitor::create()
+}
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    if let Some(m) = metal_monitor::MetalMonitor::new() {
-        return Box::new(m);
-    }
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn platform_probe() -> Option<Box<dyn GpuMonitor>> {
+    metal_monitor::create()
+}
 
-    tracing::warn!("no GPU monitor backend available; VRAM budgeting degraded");
-    Box::new(FallbackMonitor)
+#[cfg(not(any(
+    all(not(target_os = "macos"), feature = "nvml"),
+    all(target_os = "macos", feature = "metal")
+)))]
+fn platform_probe() -> Option<Box<dyn GpuMonitor>> {
+    None
+}
+
+pub fn probe() -> Box<dyn GpuMonitor> {
+    platform_probe().unwrap_or_else(|| {
+        tracing::warn!("no GPU monitor backend available; GPU telemetry degraded");
+        Box::new(FallbackMonitor)
+    })
 }

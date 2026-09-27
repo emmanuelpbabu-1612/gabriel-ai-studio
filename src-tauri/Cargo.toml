@@ -5,6 +5,7 @@ description = "Gabriel - native zero-crash multi-modal local AI engine"
 authors = ["you"]
 edition = "2024"
 rust-version = "1.85"
+default-run = "gabriel"
 
 [lib]
 name = "gabriel_lib"
@@ -15,9 +16,11 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-stream     = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,6 +32,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sysinfo = "0.33"
 rayon = "1.10"
+dirs = "6"
+ureq = { version = "3.4", features = ["json"] }
+sha2 = "0.10"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 nvml-wrapper = { version = "0.10", optional = true }
@@ -37,7 +43,7 @@ nvml-wrapper = { version = "0.10", optional = true }
 metal = { version = "0.30", optional = true }
 
 [features]
-default = ["nvml", "candle-cuda"]
+default = ["nvml"]
 nvml = ["dep:nvml-wrapper"]
 metal = ["dep:metal"]
 candle-cuda = ["dep:candle-core", "dep:candle-transformers", "dep:candle-kernels", "dep:tokenizers", "dep:hf-hub", "dep:image", "dep:candle-nn"]
@@ -70,7 +76,6 @@ version = "0.5.0"
 default-features = false
 features = ["tokio", "ureq"]
 optional = true
-
 
 [dependencies.image]
 version = "0.25"
